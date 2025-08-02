@@ -18,7 +18,7 @@ def add_purchase():
         """, (data['material_id'], data['quantity'], data['cost_per_unit'], data['gst_rate'], data['invoice_ref'], 45868))
         update_inventory(data['material_id'], data['quantity'], data['cost_per_unit'], conn, cur)
         conn.commit()
-        # Update materials table with new weighted avg (simplified)
+        # Update materials table with new weighted avg
         cur.execute("SELECT weighted_avg_cost FROM inventory WHERE material_id = %s", (data['material_id'],))
         new_avg = cur.fetchone()[0]
         cur.execute("UPDATE materials SET current_cost = %s WHERE material_id = %s", (new_avg, data['material_id']))
@@ -31,4 +31,4 @@ def add_purchase():
         close_connection(conn, cur)
 
 if __name__ == '__main__':
-    app.run()
+    app.run(debug=True)  # For local testing only

@@ -9,6 +9,7 @@ CORS(app)  # Allow frontend access
 
 @app.route('/api/materials', methods=['GET'])
 def get_materials():
+    """Fetch all materials for the frontend dropdown."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -19,8 +20,10 @@ def get_materials():
         return jsonify({'error': str(e)}), 500
     finally:
         close_connection(conn, cur)
+
 @app.route('/api/add_purchase', methods=['POST'])
 def add_purchase():
+    """Handle purchase data submission and update inventory/weighted average."""
     data = request.json  # e.g., {material_id: 1, quantity: 5000, cost_per_unit: 95.51, gst_rate: 5, invoice_ref: "INV-38"}
     conn = get_db_connection()
     cur = conn.cursor()
@@ -31,7 +34,7 @@ def add_purchase():
         """, (data['material_id'], data['quantity'], data['cost_per_unit'], data['gst_rate'], data['invoice_ref'], 45868))
         update_inventory(data['material_id'], data['quantity'], data['cost_per_unit'], conn, cur)
         conn.commit()
-        # Update materials table with new weighted avg
+        # Update materials table with new weighted average cost
         cur.execute("SELECT weighted_avg_cost FROM inventory WHERE material_id = %s", (data['material_id'],))
         new_avg = cur.fetchone()[0]
         cur.execute("UPDATE materials SET current_cost = %s WHERE material_id = %s", (new_avg, data['material_id']))
@@ -45,10 +48,12 @@ def add_purchase():
 
 @app.route('/', methods=['GET'])
 def home():
+    """Return backend status with timestamp."""
     return jsonify({'status': 'Backend is running!', 'timestamp': datetime.now().isoformat()})
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
+    """Check backend and database health."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -69,4 +74,3 @@ def health_check():
 
 if __name__ == '__main__':
     app.run(debug=True)  # For local testing only
-

@@ -1,3 +1,4 @@
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from db_utils import get_db_connection, close_connection
@@ -29,6 +30,29 @@ def add_purchase():
         return jsonify({'error': str(e)}), 400
     finally:
         close_connection(conn, cur)
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({'status': 'Backend is running!', 'timestamp': datetime.now().isoformat()})
 
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM materials")
+        count = cur.fetchone()[0]
+        close_connection(conn, cur)
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'materials_count': count
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'database': 'disconnected',
+            'error': str(e)
+        }), 500
 if __name__ == '__main__':
     app.run(debug=True)  # For local testing only
+

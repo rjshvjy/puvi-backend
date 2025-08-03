@@ -9,8 +9,14 @@ app = Flask(__name__)
 CORS(app)
 
 def date_to_day_number(date_string):
-    """Convert date string (YYYY-MM-DD) to day number since epoch"""
-    date_obj = datetime.strptime(date_string, '%Y-%m-%d')
+    """Convert date string (DD-MM-YYYY) to day number since epoch"""
+    # Handle both formats for compatibility
+    if '-' in date_string and len(date_string.split('-')[0]) == 4:
+        # YYYY-MM-DD format from HTML date input
+        date_obj = datetime.strptime(date_string, '%Y-%m-%d')
+    else:
+        # DD-MM-YYYY format
+        date_obj = datetime.strptime(date_string, '%d-%m-%Y')
     epoch = datetime(1970, 1, 1)
     return (date_obj - epoch).days
 

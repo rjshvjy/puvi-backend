@@ -7,6 +7,18 @@ from inventory_utils import update_inventory
 app = Flask(__name__)
 CORS(app)  # Allow frontend access
 
+@app.route('/api/materials', methods=['GET'])
+def get_materials():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT material_id, material_name, current_cost FROM materials")
+        materials = cur.fetchall()
+        return jsonify([{'material_id': m[0], 'material_name': m[1], 'current_cost': m[2]} for m in materials])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        close_connection(conn, cur)
 @app.route('/api/add_purchase', methods=['POST'])
 def add_purchase():
     data = request.json  # e.g., {material_id: 1, quantity: 5000, cost_per_unit: 95.51, gst_rate: 5, invoice_ref: "INV-38"}
@@ -57,3 +69,4 @@ def health_check():
 
 if __name__ == '__main__':
     app.run(debug=True)  # For local testing only
+

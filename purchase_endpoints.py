@@ -279,7 +279,7 @@ def add_writeoff():
         net_loss = total_cost - scrap_value
         
         # Begin transaction
-        conn.execute("BEGIN")
+        cur.execute("BEGIN")
         
         # Insert writeoff record
         cur.execute("""
@@ -577,8 +577,8 @@ def add_batch():
         cake_yield_percent = (cake_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
         sludge_yield_percent = (sludge_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
         
-        # Begin transaction
-        conn.execute("BEGIN")
+        # Begin transaction - FIXED: Using cursor instead of connection
+        cur.execute("BEGIN")
         
         # Insert batch record
         cur.execute("""

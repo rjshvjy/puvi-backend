@@ -423,6 +423,404 @@ def get_writeoff_history():
     finally:
         close_connection(conn, cur)
 
+# ===== BATCH PRODUCTION ENDPOINTS =====
+
+@app.route('/api/seeds_for_batch', methods=['GET'])
+def get_seeds_for_batch():
+    """Get available seeds from inventory for batch production"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT 
+                i.inventory_id,
+                i.material_id,
+                m.material_name,
+                m.unit,
+                i.closing_stock as available_quantity,
+                i.weighted_avg_cost,
+                m.category
+            FROM inventory i
+            JOIN materials m ON i.material_id = m.material_id
+            WHERE m.category = 'Seeds' 
+                AND i.closing_stock > 0
+            ORDER BY m.material_name
+        """)
+        
+        seeds = []
+        for row in cur.fetchall():
+            seeds.append({
+                'inventory_id': row[0],
+                'material_id': row[1],
+                'material_name': row[2],
+                'unit': row[3],
+                'available_quantity': float(row[4]),
+                'weighted_avg_cost': float(row[5]),
+                'category': row[6]
+            })
+        
+        return jsonify({
+            'success': True,
+            'seeds': seeds
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        close_connection(conn, cur)
+
+@app.route('/api/cost_elements_for_batch', methods=['GET'])
+def get_cost_elements_for_batch():
+    """Get applicable cost elements for batch production"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get cost elements relevant for batch production
+        cur.execute("""
+            SELECT 
+                element_id,
+                element_name,
+                category,
+                unit_type,
+                default_rate,
+                calculation_method
+            FROM cost_elements
+            WHERE category IN ('Labor', 'Utilities', 'Maintenance')
+                AND element_name IN (
+                    'Drying Labour',
+                    'Seed Unloading',
+                    'Loading After Drying',
+                    'Crushing Labour',
+                    'Filtering Labour',
+                    'Electricity - Crushing',
+                    'Machine Maintenance'
+                )
+            ORDER BY category, element_name
+        """)
+        
+        cost_elements = []
+        for row in cur.fetchall():
+            cost_elements.append({
+                'element_id': row[0],
+                'element_name': row[1],
+                'category': row[2],
+                'unit_type': row[3],
+                'default_rate': float(row[4]),
+                'calculation_method': row[5]
+            })
+        
+        return jsonify({
+            'success': True,
+            'cost_elements': cost_elements
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        close_connection(conn, cur)
+
+@app.route('/api/oil_cake_rates', methods=['GET'])
+def get_oil_cake_rates():
+    """Get current oil cake rates for estimation"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get oil cake rates - you may need to create this table
+        # For now, returning some default values
+        oil_cake_rates = {
+            'Groundnut': {'cake_rate': 30.00, 'sludge_rate': 10.00},
+            'Sesame': {'cake_rate': 35.00, 'sludge_rate': 12.00},
+            'Coconut': {'cake_rate': 25.00, 'sludge_rate': 8.00},
+            'Mustard': {'cake_rate': 28.00, 'sludge_rate': 9.00}
+        }
+        
+        return jsonify({
+            'success': True,
+            'rates': oil_cake_rates
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        close_connection(conn, cur)
+
+@app.route('/api/add_batch', methods=['POST'])
+def add_batch():
+    """Create a new batch production record"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        data = request.json
+        
+        # Parse date
+        production_date = parse_date(data['production_date'])
+        
+        # Generate batch code
+        date_str = data['production_date'].replace('-', '')  # DDMMYYYY format
+        batch_code = f"BATCH-{date_str}-{data['batch_description']}"
+        
+        # Convert values to Decimal for accuracy
+        seed_qty_before = Decimal(str(data['seed_quantity_before_drying']))
+        seed_qty_after = Decimal(str(data['seed_quantity_after_drying']))
+        drying_loss = seed_qty_before - seed_qty_after
+        
+        oil_yield = Decimal(str(data['oil_yield']))
+        cake_yield = Decimal(str(data['cake_yield']))
+        sludge_yield = Decimal(str(data.get('sludge_yield', 0)))
+        
+        # Calculate percentages
+        oil_yield_percent = (oil_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
+        cake_yield_percent = (cake_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
+        sludge_yield_percent = (sludge_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
+        
+        # Begin transaction
+        conn.execute("BEGIN")
+        
+        # Insert batch record
+        cur.execute("""
+            INSERT INTO batch (
+                batch_code, oil_type, seed_quantity_before_drying,
+                seed_quantity_after_drying, drying_loss, oil_yield,
+                oil_yield_percent, oil_cake_yield, oil_cake_yield_percent,
+                production_date, recipe_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING batch_id
+        """, (
+            batch_code,
+            data['oil_type'],
+            float(seed_qty_before),
+            float(seed_qty_after),
+            float(drying_loss),
+            float(oil_yield),
+            float(oil_yield_percent),
+            float(cake_yield),
+            float(cake_yield_percent),
+            production_date,
+            None  # recipe_id - can be added later
+        ))
+        
+        batch_id = cur.fetchone()[0]
+        
+        # Process cost details
+        total_production_cost = Decimal('0')
+        
+        # 1. Seed cost
+        seed_cost = Decimal(str(data['seed_cost_total']))
+        total_production_cost += seed_cost
+        
+        # 2. Insert all cost elements
+        for cost_item in data['cost_details']:
+            cost = Decimal(str(cost_item['total_cost']))
+            total_production_cost += cost
+            
+            cur.execute("""
+                INSERT INTO batch_cost_details (
+                    batch_id, cost_element, master_rate, 
+                    override_rate, quantity, total_cost
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                batch_id,
+                cost_item['element_name'],
+                float(cost_item['master_rate']),
+                float(cost_item.get('override_rate', cost_item['master_rate'])),
+                float(cost_item['quantity']),
+                float(cost)
+            ))
+        
+        # 3. Calculate net oil cost
+        cake_revenue = Decimal(str(data['estimated_cake_revenue']))
+        sludge_revenue = Decimal(str(data.get('estimated_sludge_revenue', 0)))
+        net_oil_cost = total_production_cost - cake_revenue - sludge_revenue
+        oil_cost_per_kg = net_oil_cost / oil_yield if oil_yield > 0 else 0
+        
+        # Update batch with cost information
+        cur.execute("""
+            UPDATE batch 
+            SET total_production_cost = %s,
+                net_oil_cost = %s,
+                oil_cost_per_kg = %s,
+                cake_estimated_rate = %s,
+                sludge_estimated_rate = %s
+            WHERE batch_id = %s
+        """, (
+            float(total_production_cost),
+            float(net_oil_cost),
+            float(oil_cost_per_kg),
+            float(data['cake_estimated_rate']),
+            float(data.get('sludge_estimated_rate', 0)),
+            batch_id
+        ))
+        
+        # Update inventory
+        # 1. Reduce seed inventory
+        cur.execute("""
+            UPDATE inventory
+            SET closing_stock = closing_stock - %s,
+                consumption = consumption + %s,
+                last_updated = %s
+            WHERE material_id = %s
+        """, (
+            float(seed_qty_before),
+            float(seed_qty_before),
+            production_date,
+            data['material_id']
+        ))
+        
+        # 2. Add oil to inventory
+        # Check if oil inventory exists
+        cur.execute("""
+            SELECT inventory_id FROM inventory 
+            WHERE material_id IS NULL 
+                AND product_id IS NULL
+                AND oil_type = %s
+                AND source_type = 'extraction'
+        """, (data['oil_type'],))
+        
+        oil_inv = cur.fetchone()
+        
+        if oil_inv:
+            # Update existing oil inventory
+            cur.execute("""
+                UPDATE inventory
+                SET closing_stock = closing_stock + %s,
+                    last_updated = %s
+                WHERE inventory_id = %s
+            """, (float(oil_yield), production_date, oil_inv[0]))
+        else:
+            # Create new oil inventory record
+            cur.execute("""
+                INSERT INTO inventory (
+                    oil_type, closing_stock, weighted_avg_cost,
+                    last_updated, source_type, source_reference_id
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                data['oil_type'],
+                float(oil_yield),
+                float(oil_cost_per_kg),
+                production_date,
+                'extraction',
+                batch_id
+            ))
+        
+        # 3. Add oil cake to inventory
+        cur.execute("""
+            INSERT INTO oil_cake_inventory (
+                batch_id, oil_type, quantity_produced,
+                quantity_remaining, estimated_rate, production_date
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            batch_id,
+            data['oil_type'],
+            float(cake_yield),
+            float(cake_yield),
+            float(data['cake_estimated_rate']),
+            production_date
+        ))
+        
+        # Commit transaction
+        conn.commit()
+        
+        return jsonify({
+            'success': True,
+            'batch_id': batch_id,
+            'batch_code': batch_code,
+            'oil_cost_per_kg': float(oil_cost_per_kg),
+            'total_oil_produced': float(oil_yield),
+            'message': f'Batch {batch_code} created successfully!'
+        }), 201
+        
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        close_connection(conn, cur)
+
+@app.route('/api/batch_history', methods=['GET'])
+def get_batch_history():
+    """Get batch production history"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        oil_type = request.args.get('oil_type', None)
+        
+        query = """
+            SELECT 
+                b.batch_id,
+                b.batch_code,
+                b.oil_type,
+                b.production_date,
+                b.seed_quantity_after_drying,
+                b.oil_yield,
+                b.oil_yield_percent,
+                b.oil_cake_yield,
+                b.oil_cost_per_kg,
+                b.net_oil_cost,
+                b.total_production_cost
+            FROM batch b
+        """
+        
+        params = []
+        if oil_type:
+            query += " WHERE b.oil_type = %s"
+            params.append(oil_type)
+            
+        query += " ORDER BY b.production_date DESC, b.batch_id DESC LIMIT %s"
+        params.append(limit)
+        
+        cur.execute(query, params)
+        
+        batches = []
+        for row in cur.fetchall():
+            batches.append({
+                'batch_id': row[0],
+                'batch_code': row[1],
+                'oil_type': row[2],
+                'production_date': integer_to_date(row[3]),
+                'seed_quantity': float(row[4]),
+                'oil_yield': float(row[5]),
+                'oil_yield_percent': float(row[6]),
+                'cake_yield': float(row[7]),
+                'oil_cost_per_kg': float(row[8]),
+                'net_oil_cost': float(row[9]),
+                'total_production_cost': float(row[10])
+            })
+        
+        # Get summary statistics
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_batches,
+                SUM(oil_yield) as total_oil_produced,
+                SUM(oil_cake_yield) as total_cake_produced,
+                AVG(oil_yield_percent) as avg_oil_yield_percent,
+                AVG(oil_cost_per_kg) as avg_oil_cost
+            FROM batch
+        """)
+        
+        stats = cur.fetchone()
+        
+        return jsonify({
+            'success': True,
+            'batches': batches,
+            'summary': {
+                'total_batches': stats[0],
+                'total_oil_produced': float(stats[1] or 0),
+                'total_cake_produced': float(stats[2] or 0),
+                'avg_oil_yield_percent': float(stats[3] or 0),
+                'avg_oil_cost': float(stats[4] or 0)
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        close_connection(conn, cur)
+
 # ===== EXISTING ENDPOINTS (unchanged) =====
 
 @app.route('/api/materials', methods=['GET'])
@@ -460,7 +858,7 @@ def home():
     return jsonify({
         'status': 'Backend is running!', 
         'timestamp': datetime.now().isoformat(),
-        'version': '2.0'  # Updated version
+        'version': '3.0'  # Updated version
     })
 
 @app.route('/api/health', methods=['GET'])
@@ -472,13 +870,16 @@ def health_check():
         material_count = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM purchases")
         purchase_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM batch")
+        batch_count = cur.fetchone()[0]
         close_connection(conn, cur)
         
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
             'materials_count': material_count,
-            'purchases_count': purchase_count
+            'purchases_count': purchase_count,
+            'batches_count': batch_count
         })
     except Exception as e:
         return jsonify({

@@ -30,6 +30,7 @@ def add_purchase():
         return jsonify({'error': str(e)}), 400
     finally:
         close_connection(conn, cur)
+
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({'status': 'Backend is running!', 'timestamp': datetime.now().isoformat()})
@@ -53,7 +54,6 @@ def health_check():
             'database': 'disconnected',
             'error': str(e)
         }), 500
+
 if __name__ == '__main__':
     app.run(debug=True)  # For local testing only
-
-

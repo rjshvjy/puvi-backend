@@ -3,10 +3,51 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from db_utils import get_db_connection, close_connection
 from inventory_utils import update_inventory
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 app = Flask(__name__)
 CORS(app)
+
+def safe_decimal(value, default=0):
+    """
+    Safely convert a value to Decimal, handling various edge cases
+    
+    Args:
+        value: The value to convert (can be string, number, None, etc.)
+        default: Default value if conversion fails (default: 0)
+    
+    Returns:
+        Decimal: The converted value or default
+    """
+    try:
+        # Handle None, empty string, or string with only whitespace
+        if value is None or value == '' or (isinstance(value, str) and value.strip() == ''):
+            return Decimal(str(default))
+        
+        # Convert to string first to handle various numeric types
+        return Decimal(str(value))
+    except (ValueError, TypeError, InvalidOperation) as e:
+        print(f"Warning: Could not convert '{value}' to Decimal. Using default: {default}. Error: {e}")
+        return Decimal(str(default))
+
+def safe_float(value, default=0):
+    """
+    Safely convert a value to float, handling various edge cases
+    
+    Args:
+        value: The value to convert
+        default: Default value if conversion fails
+    
+    Returns:
+        float: The converted value or default
+    """
+    try:
+        if value is None or value == '' or (isinstance(value, str) and value.strip() == ''):
+            return float(default)
+        return float(value)
+    except (ValueError, TypeError) as e:
+        print(f"Warning: Could not convert '{value}' to float. Using default: {default}. Error: {e}")
+        return float(default)
 
 def date_to_day_number(date_string):
     """Convert date string (DD-MM-YYYY) to day number since epoch"""
@@ -549,12 +590,15 @@ def get_oil_cake_rates():
 
 @app.route('/api/add_batch', methods=['POST'])
 def add_batch():
-    """Create a new batch production record"""
+    """Create a new batch production record with comprehensive validation"""
     conn = get_db_connection()
     cur = conn.cursor()
     
     try:
         data = request.json
+        
+        # Debug logging
+        print(f"Received batch data: {data}")
         
         # Parse date
         production_date = parse_date(data['production_date'])
@@ -563,31 +607,39 @@ def add_batch():
         date_str = data['production_date'].replace('-', '')  # DDMMYYYY format
         batch_code = f"BATCH-{date_str}-{data['batch_description']}"
         
-        # Convert values to Decimal for accuracy
-        seed_qty_before = Decimal(str(data['seed_quantity_before_drying']))
-        seed_qty_after = Decimal(str(data['seed_quantity_after_drying']))
-        drying_loss = seed_qty_before - seed_qty_after
+        # Safely convert values to Decimal with validation
+        seed_qty_before = safe_decimal(data.get('seed_quantity_before_drying', 0))
+        seed_qty_after = safe_decimal(data.get('seed_quantity_after_drying', 0))
+        oil_yield = safe_decimal(data.get('oil_yield', 0))
+        cake_yield = safe_decimal(data.get('cake_yield', 0))
+        sludge_yield = safe_decimal(data.get('sludge_yield', 0))
         
-        oil_yield = Decimal(str(data['oil_yield']))
-        cake_yield = Decimal(str(data['cake_yield']))
-        sludge_yield = Decimal(str(data.get('sludge_yield', 0)))
+        # Validate quantities
+        if seed_qty_before <= 0:
+            return jsonify({'error': 'Seed quantity before drying must be greater than 0'}), 400
+        if seed_qty_after <= 0:
+            return jsonify({'error': 'Seed quantity after drying must be greater than 0'}), 400
+        if seed_qty_after > seed_qty_before:
+            return jsonify({'error': 'Seed quantity after drying cannot exceed quantity before drying'}), 400
+        
+        drying_loss = seed_qty_before - seed_qty_after
         
         # Calculate percentages
         oil_yield_percent = (oil_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
         cake_yield_percent = (cake_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
         sludge_yield_percent = (sludge_yield / seed_qty_after * 100) if seed_qty_after > 0 else 0
         
-        # Begin transaction - FIXED: Using cursor instead of connection
+        # Begin transaction
         cur.execute("BEGIN")
         
-        # Insert batch record
+        # Insert batch record with additional fields
         cur.execute("""
             INSERT INTO batch (
                 batch_code, oil_type, seed_quantity_before_drying,
                 seed_quantity_after_drying, drying_loss, oil_yield,
                 oil_yield_percent, oil_cake_yield, oil_cake_yield_percent,
-                production_date, recipe_id
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                sludge_yield, sludge_yield_percent, production_date, recipe_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING batch_id
         """, (
             batch_code,
@@ -599,6 +651,8 @@ def add_batch():
             float(oil_yield_percent),
             float(cake_yield),
             float(cake_yield_percent),
+            float(sludge_yield),
+            float(sludge_yield_percent),
             production_date,
             None  # recipe_id - can be added later
         ))
@@ -606,16 +660,27 @@ def add_batch():
         batch_id = cur.fetchone()[0]
         
         # Process cost details
-        total_production_cost = Decimal('0')
+        total_production_cost = safe_decimal(data.get('seed_cost_total', 0))
         
-        # 1. Seed cost
-        seed_cost = Decimal(str(data['seed_cost_total']))
-        total_production_cost += seed_cost
-        
-        # 2. Insert all cost elements
-        for cost_item in data['cost_details']:
-            cost = Decimal(str(cost_item['total_cost']))
-            total_production_cost += cost
+        # Insert all cost elements with validation
+        cost_details = data.get('cost_details', [])
+        for cost_item in cost_details:
+            # Validate each cost item
+            element_name = cost_item.get('element_name', '')
+            master_rate = safe_float(cost_item.get('master_rate', 0))
+            
+            # Handle override rate - if empty string or None, use master rate
+            override_rate_value = cost_item.get('override_rate')
+            if override_rate_value in (None, '', 'null'):
+                override_rate = master_rate
+            else:
+                override_rate = safe_float(override_rate_value, master_rate)
+            
+            quantity = safe_float(cost_item.get('quantity', 0))
+            total_cost = safe_float(cost_item.get('total_cost', 0))
+            
+            # Add to total production cost
+            total_production_cost += Decimal(str(total_cost))
             
             cur.execute("""
                 INSERT INTO batch_cost_details (
@@ -624,16 +689,19 @@ def add_batch():
                 ) VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 batch_id,
-                cost_item['element_name'],
-                float(cost_item['master_rate']),
-                float(cost_item.get('override_rate', cost_item['master_rate'])),
-                float(cost_item['quantity']),
-                float(cost)
+                element_name,
+                master_rate,
+                override_rate,
+                quantity,
+                total_cost
             ))
         
-        # 3. Calculate net oil cost
-        cake_revenue = Decimal(str(data['estimated_cake_revenue']))
-        sludge_revenue = Decimal(str(data.get('estimated_sludge_revenue', 0)))
+        # Calculate net oil cost with safe decimal conversion
+        cake_estimated_rate = safe_decimal(data.get('cake_estimated_rate', 0))
+        sludge_estimated_rate = safe_decimal(data.get('sludge_estimated_rate', 0))
+        
+        cake_revenue = cake_yield * cake_estimated_rate
+        sludge_revenue = sludge_yield * sludge_estimated_rate
         net_oil_cost = total_production_cost - cake_revenue - sludge_revenue
         oil_cost_per_kg = net_oil_cost / oil_yield if oil_yield > 0 else 0
         
@@ -650,8 +718,8 @@ def add_batch():
             float(total_production_cost),
             float(net_oil_cost),
             float(oil_cost_per_kg),
-            float(data['cake_estimated_rate']),
-            float(data.get('sludge_estimated_rate', 0)),
+            float(cake_estimated_rate),
+            float(sludge_estimated_rate),
             batch_id
         ))
         
@@ -695,31 +763,34 @@ def add_batch():
             cur.execute("""
                 INSERT INTO inventory (
                     oil_type, closing_stock, weighted_avg_cost,
-                    last_updated, source_type, source_reference_id
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    last_updated, source_type, source_reference_id,
+                    is_bulk_oil
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (
                 data['oil_type'],
                 float(oil_yield),
                 float(oil_cost_per_kg),
                 production_date,
                 'extraction',
-                batch_id
+                batch_id,
+                True
             ))
         
         # 3. Add oil cake to inventory
-        cur.execute("""
-            INSERT INTO oil_cake_inventory (
-                batch_id, oil_type, quantity_produced,
-                quantity_remaining, estimated_rate, production_date
-            ) VALUES (%s, %s, %s, %s, %s, %s)
-        """, (
-            batch_id,
-            data['oil_type'],
-            float(cake_yield),
-            float(cake_yield),
-            float(data['cake_estimated_rate']),
-            production_date
-        ))
+        if cake_yield > 0:
+            cur.execute("""
+                INSERT INTO oil_cake_inventory (
+                    batch_id, oil_type, quantity_produced,
+                    quantity_remaining, estimated_rate, production_date
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                batch_id,
+                data['oil_type'],
+                float(cake_yield),
+                float(cake_yield),
+                float(cake_estimated_rate),
+                production_date
+            ))
         
         # Commit transaction
         conn.commit()
@@ -735,6 +806,9 @@ def add_batch():
         
     except Exception as e:
         conn.rollback()
+        print(f"Error in add_batch: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         close_connection(conn, cur)
@@ -761,7 +835,9 @@ def get_batch_history():
                 b.oil_cake_yield,
                 b.oil_cost_per_kg,
                 b.net_oil_cost,
-                b.total_production_cost
+                b.total_production_cost,
+                b.sludge_yield,
+                b.cake_estimated_rate
             FROM batch b
         """
         
@@ -788,7 +864,9 @@ def get_batch_history():
                 'cake_yield': float(row[7]),
                 'oil_cost_per_kg': float(row[8]),
                 'net_oil_cost': float(row[9]),
-                'total_production_cost': float(row[10])
+                'total_production_cost': float(row[10]),
+                'sludge_yield': float(row[11]) if row[11] else 0,
+                'cake_rate': float(row[12]) if row[12] else 0
             })
         
         # Get summary statistics
@@ -858,7 +936,7 @@ def home():
     return jsonify({
         'status': 'Backend is running!', 
         'timestamp': datetime.now().isoformat(),
-        'version': '3.0'  # Updated version
+        'version': '3.1'  # Updated version
     })
 
 @app.route('/api/health', methods=['GET'])
@@ -879,7 +957,8 @@ def health_check():
             'database': 'connected',
             'materials_count': material_count,
             'purchases_count': purchase_count,
-            'batches_count': batch_count
+            'batches_count': batch_count,
+            'version': '3.1'
         })
     except Exception as e:
         return jsonify({

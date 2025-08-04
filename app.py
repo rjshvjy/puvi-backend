@@ -16,16 +16,20 @@ from modules.batch_production import batch_bp
 # Create Flask app
 app = Flask(__name__)
 
-# Enable CORS for all routes
+# Enable CORS for all routes - Updated to handle all Vercel URLs
 CORS(app, resources={
     r"/api/*": {
         "origins": [
             "http://localhost:3000",
+            "http://localhost:3001",
             "https://puvi-frontend.vercel.app",
-            "https://puvi-frontend-*.vercel.app"
+            "https://puvi-frontend-*.vercel.app",
+            "https://*.vercel.app",  # This will catch all Vercel preview URLs
+            "https://puvi-frontend-740w3x6v2-rajeshs-projects-8be31e4e.vercel.app"  # Your specific URL
         ],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True
     }
 })
 

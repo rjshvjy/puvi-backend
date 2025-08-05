@@ -1,6 +1,6 @@
 """
 Purchase Module for PUVI Oil Manufacturing System - Multi-Item Support
-Handles multi-item purchase invoices with tag support
+Handles multi-item purchase invoices with tag support and traceability
 """
 
 from flask import Blueprint, request, jsonify
@@ -9,6 +9,7 @@ from db_utils import get_db_connection, close_connection
 from inventory_utils import update_inventory
 from utils.date_utils import date_to_day_number, integer_to_date
 from utils.validation import safe_decimal, validate_required_fields
+from utils.traceability import generate_purchase_traceable_code
 
 # Create Blueprint
 purchase_bp = Blueprint('purchase', __name__)
@@ -32,13 +33,14 @@ def get_materials():
                     m.gst_rate,
                     m.unit,
                     m.category,
-                    ARRAY_AGG(DISTINCT t.tag_name) as tags
+                    ARRAY_AGG(DISTINCT t.tag_name) as tags,
+                    m.short_code
                 FROM materials m
                 LEFT JOIN material_tags mt ON m.material_id = mt.material_id
                 LEFT JOIN tags t ON mt.tag_id = t.tag_id
                 WHERE m.supplier_id = %s
                 GROUP BY m.material_id, m.material_name, m.current_cost, 
-                         m.gst_rate, m.unit, m.category
+                         m.gst_rate, m.unit, m.category, m.short_code
                 ORDER BY m.material_name
             """, (supplier_id,))
         else:
@@ -53,13 +55,15 @@ def get_materials():
                     m.category,
                     s.supplier_id,
                     s.supplier_name,
-                    ARRAY_AGG(DISTINCT t.tag_name) as tags
+                    ARRAY_AGG(DISTINCT t.tag_name) as tags,
+                    m.short_code
                 FROM materials m
                 LEFT JOIN suppliers s ON m.supplier_id = s.supplier_id
                 LEFT JOIN material_tags mt ON m.material_id = mt.material_id
                 LEFT JOIN tags t ON mt.tag_id = t.tag_id
                 GROUP BY m.material_id, m.material_name, m.current_cost, 
-                         m.gst_rate, m.unit, m.category, s.supplier_id, s.supplier_name
+                         m.gst_rate, m.unit, m.category, s.supplier_id, 
+                         s.supplier_name, m.short_code
                 ORDER BY m.material_name
             """)
         
@@ -72,7 +76,8 @@ def get_materials():
                 'gst_rate': float(row[3]),
                 'unit': row[4],
                 'category': row[5],
-                'tags': row[6] if supplier_id else row[8]
+                'tags': row[6] if supplier_id else row[8],
+                'short_code': row[7] if supplier_id else row[9]
             }
             
             if not supplier_id:
@@ -95,7 +100,7 @@ def get_materials():
 
 @purchase_bp.route('/api/add_purchase', methods=['POST'])
 def add_purchase():
-    """Add a new multi-item purchase transaction"""
+    """Add a new multi-item purchase transaction with traceability"""
     data = request.json
     conn = get_db_connection()
     cur = conn.cursor()
@@ -115,6 +120,18 @@ def add_purchase():
             return jsonify({
                 'success': False,
                 'error': 'At least one item is required'
+            }), 400
+        
+        # Check if supplier has short code
+        cur.execute("""
+            SELECT short_code FROM suppliers WHERE supplier_id = %s
+        """, (data['supplier_id'],))
+        supplier_result = cur.fetchone()
+        
+        if not supplier_result or not supplier_result[0]:
+            return jsonify({
+                'success': False,
+                'error': 'Supplier short code not set. Please set a 3-letter code for this supplier first.'
             }), 400
         
         # Begin transaction
@@ -166,8 +183,23 @@ def add_purchase():
         
         purchase_id = cur.fetchone()[0]
         
-        # Insert purchase items
+        # Insert purchase items with traceable codes
+        traceable_codes = []
+        
         for item in data['items']:
+            # Check if material has short code
+            cur.execute("""
+                SELECT short_code FROM materials WHERE material_id = %s
+            """, (item['material_id'],))
+            material_result = cur.fetchone()
+            
+            if not material_result or not material_result[0]:
+                conn.rollback()
+                return jsonify({
+                    'success': False,
+                    'error': f'Material short code not set for material ID {item["material_id"]}. Please set short codes for all materials first.'
+                }), 400
+            
             quantity = safe_decimal(item['quantity'])
             rate = safe_decimal(item['rate'])
             amount = quantity * rate
@@ -184,6 +216,22 @@ def add_purchase():
             # Total for this item
             item_total = amount + gst_amount + item_transport + item_handling
             landed_cost_per_unit = item_total / quantity if quantity > 0 else 0
+            
+            # Generate traceable code for this item
+            try:
+                traceable_code = generate_purchase_traceable_code(
+                    item['material_id'],
+                    data['supplier_id'],
+                    purchase_date,
+                    cur
+                )
+                traceable_codes.append(traceable_code)
+            except Exception as e:
+                conn.rollback()
+                return jsonify({
+                    'success': False,
+                    'error': f'Error generating traceable code: {str(e)}'
+                }), 500
             
             # Insert item
             cur.execute("""
@@ -230,16 +278,25 @@ def add_purchase():
                 WHERE material_id = %s
             """, (item['material_id'], purchase_date, item['material_id']))
         
+        # Update purchase record with traceable codes (store first code as reference)
+        if traceable_codes:
+            cur.execute("""
+                UPDATE purchases
+                SET traceable_code = %s
+                WHERE purchase_id = %s
+            """, (traceable_codes[0], purchase_id))
+        
         # Commit transaction
         conn.commit()
         
         return jsonify({
             'success': True,
-            'message': 'Purchase added successfully',
+            'message': 'Purchase added successfully with traceable codes',
             'purchase_id': purchase_id,
             'invoice_ref': data['invoice_ref'],
             'total_cost': float(total_cost),
-            'items_count': len(data['items'])
+            'items_count': len(data['items']),
+            'traceable_codes': traceable_codes
         }), 201
         
     except Exception as e:
@@ -253,7 +310,7 @@ def add_purchase():
 
 @purchase_bp.route('/api/purchase_history', methods=['GET'])
 def get_purchase_history():
-    """Get purchase history with header and items"""
+    """Get purchase history with header and items including traceable codes"""
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -274,7 +331,8 @@ def get_purchase_history():
                 p.subtotal,
                 p.total_gst_amount,
                 p.total_cost,
-                COUNT(pi.item_id) as item_count
+                COUNT(pi.item_id) as item_count,
+                p.traceable_code
             FROM purchases p
             LEFT JOIN suppliers s ON p.supplier_id = s.supplier_id
             LEFT JOIN purchase_items pi ON p.purchase_id = pi.purchase_id
@@ -288,7 +346,7 @@ def get_purchase_history():
             
         query += " GROUP BY p.purchase_id, p.invoice_ref, p.purchase_date, "
         query += "p.supplier_id, s.supplier_name, p.transport_cost, "
-        query += "p.loading_charges, p.subtotal, p.total_gst_amount, p.total_cost"
+        query += "p.loading_charges, p.subtotal, p.total_gst_amount, p.total_cost, p.traceable_code"
         query += " ORDER BY p.purchase_date DESC, p.purchase_id DESC LIMIT %s"
         params.append(limit)
         
@@ -307,7 +365,8 @@ def get_purchase_history():
                 'subtotal': float(row[7]) if row[7] else 0,
                 'total_gst': float(row[8]) if row[8] else 0,
                 'total_cost': float(row[9]) if row[9] else 0,
-                'item_count': row[10]
+                'item_count': row[10],
+                'traceable_code': row[11]
             }
             
             # Get items for this purchase
@@ -325,7 +384,8 @@ def get_purchase_history():
                     pi.transport_charges,
                     pi.handling_charges,
                     pi.total_amount,
-                    pi.landed_cost_per_unit
+                    pi.landed_cost_per_unit,
+                    m.short_code
                 FROM purchase_items pi
                 JOIN materials m ON pi.material_id = m.material_id
                 WHERE pi.purchase_id = %s
@@ -347,7 +407,8 @@ def get_purchase_history():
                     'transport_charges': float(item_row[9]),
                     'handling_charges': float(item_row[10]),
                     'total_amount': float(item_row[11]),
-                    'landed_cost_per_unit': float(item_row[12])
+                    'landed_cost_per_unit': float(item_row[12]),
+                    'material_short_code': item_row[13]
                 })
             
             purchase['items'] = items
@@ -386,7 +447,7 @@ def get_purchase_history():
 
 @purchase_bp.route('/api/suppliers', methods=['GET'])
 def get_suppliers():
-    """Get list of suppliers with material count"""
+    """Get list of suppliers with material count and short codes"""
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -399,11 +460,12 @@ def get_suppliers():
                 s.phone,
                 s.email,
                 s.gst_number,
-                COUNT(DISTINCT m.material_id) as material_count
+                COUNT(DISTINCT m.material_id) as material_count,
+                s.short_code
             FROM suppliers s
             LEFT JOIN materials m ON s.supplier_id = m.supplier_id
             GROUP BY s.supplier_id, s.supplier_name, s.contact_person,
-                     s.phone, s.email, s.gst_number
+                     s.phone, s.email, s.gst_number, s.short_code
             ORDER BY s.supplier_name
         """)
         
@@ -416,7 +478,8 @@ def get_suppliers():
                 'phone': row[3],
                 'email': row[4],
                 'gst_number': row[5],
-                'material_count': row[6]
+                'material_count': row[6],
+                'short_code': row[7]
             })
         
         return jsonify({

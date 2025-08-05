@@ -12,6 +12,7 @@ from db_utils import get_db_connection, close_connection
 from modules.purchase import purchase_bp
 from modules.material_writeoff import writeoff_bp
 from modules.batch_production import batch_bp
+from modules.blending import blending_bp  # NEW - Import blending module
 
 # Create Flask app
 app = Flask(__name__)
@@ -37,6 +38,7 @@ CORS(app, resources={
 app.register_blueprint(purchase_bp)
 app.register_blueprint(writeoff_bp)
 app.register_blueprint(batch_bp)
+app.register_blueprint(blending_bp)  # NEW - Register blending blueprint
 
 # Configuration
 app.config['JSON_SORT_KEYS'] = False
@@ -48,7 +50,7 @@ def home():
     """Root endpoint to verify API is running"""
     return jsonify({
         'status': 'PUVI Backend API is running!',
-        'version': '4.0',  # Modular version
+        'version': '5.0',  # Updated version
         'timestamp': datetime.now().isoformat(),
         'endpoints': {
             'health': '/api/health',
@@ -71,6 +73,12 @@ def home():
                     '/api/oil_cake_rates',
                     '/api/add_batch',
                     '/api/batch_history'
+                ],
+                'blending': [  # NEW - Blending endpoints
+                    '/api/oil_types_for_blending',
+                    '/api/batches_for_oil_type',
+                    '/api/create_blend',
+                    '/api/blend_history'
                 ]
             }
         }
@@ -90,13 +98,17 @@ def health_check():
             'purchases': "SELECT COUNT(*) FROM purchases",
             'batches': "SELECT COUNT(*) FROM batch",
             'writeoffs': "SELECT COUNT(*) FROM material_writeoffs",
+            'blends': "SELECT COUNT(*) FROM blend_batches",  # NEW - Count blends
             'inventory_items': "SELECT COUNT(*) FROM inventory WHERE closing_stock > 0"
         }
         
         counts = {}
         for key, query in queries.items():
-            cur.execute(query)
-            counts[key] = cur.fetchone()[0]
+            try:
+                cur.execute(query)
+                counts[key] = cur.fetchone()[0]
+            except:
+                counts[key] = 0  # Table might not exist yet
         
         # Get database size
         cur.execute("""
@@ -117,7 +129,7 @@ def health_check():
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
-            'version': '4.0',
+            'version': '5.0',
             'counts': counts,
             'database_size_mb': round(db_size / 1024 / 1024, 2),
             'active_modules': sorted(active_modules),
@@ -216,6 +228,28 @@ def system_info():
             'total_cake_produced': float(row[2]),
             'average_oil_yield': float(row[3])
         }
+        
+        # Blending statistics - NEW
+        try:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_blends,
+                    COALESCE(SUM(total_quantity), 0) as total_blended,
+                    COALESCE(AVG(weighted_avg_cost), 0) as avg_blend_cost
+                FROM blend_batches
+            """)
+            row = cur.fetchone()
+            stats['blending'] = {
+                'total_blends': row[0],
+                'total_quantity_blended': float(row[1]),
+                'average_blend_cost': float(row[2])
+            }
+        except:
+            stats['blending'] = {
+                'total_blends': 0,
+                'total_quantity_blended': 0,
+                'average_blend_cost': 0
+            }
         
         # Writeoff statistics
         cur.execute("""

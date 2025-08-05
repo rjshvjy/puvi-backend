@@ -1,6 +1,8 @@
 """
 Main Flask Application for PUVI Oil Manufacturing System
 Integrates all modules and provides central configuration
+
+File Path: puvi-backend/app.py
 """
 
 from flask import Flask, jsonify
@@ -12,7 +14,8 @@ from db_utils import get_db_connection, close_connection
 from modules.purchase import purchase_bp
 from modules.material_writeoff import writeoff_bp
 from modules.batch_production import batch_bp
-from modules.blending import blending_bp  # NEW - Import blending module
+from modules.blending import blending_bp
+from modules.material_sales import material_sales_bp  # NEW - Import material sales module
 
 # Create Flask app
 app = Flask(__name__)
@@ -38,7 +41,8 @@ CORS(app, resources={
 app.register_blueprint(purchase_bp)
 app.register_blueprint(writeoff_bp)
 app.register_blueprint(batch_bp)
-app.register_blueprint(blending_bp)  # NEW - Register blending blueprint
+app.register_blueprint(blending_bp)
+app.register_blueprint(material_sales_bp)  # NEW - Register material sales blueprint
 
 # Configuration
 app.config['JSON_SORT_KEYS'] = False
@@ -50,7 +54,7 @@ def home():
     """Root endpoint to verify API is running"""
     return jsonify({
         'status': 'PUVI Backend API is running!',
-        'version': '5.0',  # Updated version
+        'version': '6.0',  # Updated version
         'timestamp': datetime.now().isoformat(),
         'endpoints': {
             'health': '/api/health',
@@ -74,11 +78,18 @@ def home():
                     '/api/add_batch',
                     '/api/batch_history'
                 ],
-                'blending': [  # NEW - Blending endpoints
+                'blending': [
                     '/api/oil_types_for_blending',
                     '/api/batches_for_oil_type',
                     '/api/create_blend',
                     '/api/blend_history'
+                ],
+                'material_sales': [  # NEW - Material sales endpoints
+                    '/api/byproduct_types',
+                    '/api/material_sales_inventory',
+                    '/api/add_material_sale',
+                    '/api/material_sales_history',
+                    '/api/cost_reconciliation_report'
                 ]
             }
         }
@@ -98,7 +109,8 @@ def health_check():
             'purchases': "SELECT COUNT(*) FROM purchases",
             'batches': "SELECT COUNT(*) FROM batch",
             'writeoffs': "SELECT COUNT(*) FROM material_writeoffs",
-            'blends': "SELECT COUNT(*) FROM blend_batches",  # NEW - Count blends
+            'blends': "SELECT COUNT(*) FROM blend_batches",
+            'material_sales': "SELECT COUNT(*) FROM oil_cake_sales",  # NEW - Count material sales
             'inventory_items': "SELECT COUNT(*) FROM inventory WHERE closing_stock > 0"
         }
         
@@ -129,7 +141,7 @@ def health_check():
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
-            'version': '5.0',
+            'version': '6.0',
             'counts': counts,
             'database_size_mb': round(db_size / 1024 / 1024, 2),
             'active_modules': sorted(active_modules),
@@ -229,7 +241,7 @@ def system_info():
             'average_oil_yield': float(row[3])
         }
         
-        # Blending statistics - NEW
+        # Blending statistics
         try:
             cur.execute("""
                 SELECT 
@@ -249,6 +261,40 @@ def system_info():
                 'total_blends': 0,
                 'total_quantity_blended': 0,
                 'average_blend_cost': 0
+            }
+        
+        # Material Sales statistics - NEW
+        try:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_sales,
+                    COALESCE(SUM(quantity_sold), 0) as total_quantity_sold,
+                    COALESCE(SUM(total_amount), 0) as total_revenue,
+                    COUNT(DISTINCT buyer_name) as unique_buyers
+                FROM oil_cake_sales
+            """)
+            row = cur.fetchone()
+            stats['material_sales'] = {
+                'total_sales': row[0],
+                'total_quantity_sold': float(row[1]),
+                'total_revenue': float(row[2]),
+                'unique_buyers': row[3]
+            }
+            
+            # Get cost adjustments
+            cur.execute("""
+                SELECT COALESCE(SUM(oil_cost_adjustment), 0) as total_adjustments
+                FROM oil_cake_sale_allocations
+            """)
+            adjustment = cur.fetchone()
+            stats['material_sales']['total_cost_adjustments'] = float(adjustment[0])
+        except:
+            stats['material_sales'] = {
+                'total_sales': 0,
+                'total_quantity_sold': 0,
+                'total_revenue': 0,
+                'unique_buyers': 0,
+                'total_cost_adjustments': 0
             }
         
         # Writeoff statistics

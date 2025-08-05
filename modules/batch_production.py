@@ -1,6 +1,6 @@
 """
 Batch Production Module for PUVI Oil Manufacturing System
-Handles oil extraction from seeds, cost allocation, and by-product tracking
+Handles oil extraction from seeds, cost allocation, by-product tracking, and traceability
 """
 
 from flask import Blueprint, request, jsonify
@@ -8,31 +8,37 @@ from decimal import Decimal
 from db_utils import get_db_connection, close_connection
 from utils.date_utils import parse_date, integer_to_date
 from utils.validation import safe_decimal, safe_float, validate_positive_number
+from utils.traceability import generate_batch_traceable_code
 
 # Create Blueprint
 batch_bp = Blueprint('batch', __name__)
 
 @batch_bp.route('/api/seeds_for_batch', methods=['GET'])
 def get_seeds_for_batch():
-    """Get available seeds from inventory for batch production"""
+    """Get available seeds from inventory for batch production with purchase traceable codes"""
     conn = get_db_connection()
     cur = conn.cursor()
     
     try:
+        # Modified query to include purchase traceable codes
         cur.execute("""
-            SELECT 
+            SELECT DISTINCT ON (i.material_id)
                 i.inventory_id,
                 i.material_id,
                 m.material_name,
                 m.unit,
                 i.closing_stock as available_quantity,
                 i.weighted_avg_cost,
-                m.category
+                m.category,
+                m.short_code,
+                p.traceable_code as latest_purchase_code
             FROM inventory i
             JOIN materials m ON i.material_id = m.material_id
+            LEFT JOIN purchases p ON p.supplier_id = m.supplier_id
+            LEFT JOIN purchase_items pi ON pi.purchase_id = p.purchase_id AND pi.material_id = m.material_id
             WHERE m.category = 'Seeds' 
                 AND i.closing_stock > 0
-            ORDER BY m.material_name
+            ORDER BY i.material_id, p.purchase_date DESC
         """)
         
         seeds = []
@@ -48,6 +54,8 @@ def get_seeds_for_batch():
                 'available_quantity': float(row[4]),
                 'weighted_avg_cost': float(row[5]),
                 'category': row[6],
+                'short_code': row[7],
+                'latest_purchase_code': row[8],
                 'total_value': value
             })
         
@@ -186,7 +194,7 @@ def get_oil_cake_rates():
 
 @batch_bp.route('/api/add_batch', methods=['POST'])
 def add_batch():
-    """Create a new batch production record with comprehensive validation"""
+    """Create a new batch production record with comprehensive validation and traceability"""
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -219,6 +227,43 @@ def add_batch():
         # Generate batch code
         date_str = data['production_date'].replace('-', '')
         batch_code = f"BATCH-{date_str}-{data['batch_description']}"
+        
+        # Get seed purchase traceable code for this material
+        seed_purchase_code = data.get('seed_purchase_code')
+        if not seed_purchase_code:
+            # Try to get the latest purchase code for this material
+            cur.execute("""
+                SELECT p.traceable_code
+                FROM purchases p
+                JOIN purchase_items pi ON p.purchase_id = pi.purchase_id
+                WHERE pi.material_id = %s 
+                    AND p.traceable_code IS NOT NULL
+                ORDER BY p.purchase_date DESC
+                LIMIT 1
+            """, (data['material_id'],))
+            
+            result = cur.fetchone()
+            if result:
+                seed_purchase_code = result[0]
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'No purchase traceable code found for this seed. The seed must have been purchased with traceability enabled.'
+                }), 400
+        
+        # Generate batch traceable code
+        try:
+            batch_traceable_code = generate_batch_traceable_code(
+                data['material_id'],
+                seed_purchase_code,
+                production_date,
+                cur
+            )
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'Error generating batch traceable code: {str(e)}'
+            }), 500
         
         # Safely convert values to Decimal with validation
         seed_qty_before = safe_decimal(data.get('seed_quantity_before_drying', 0))
@@ -268,14 +313,15 @@ def add_batch():
         # Begin transaction
         cur.execute("BEGIN")
         
-        # Insert batch record
+        # Insert batch record with traceable code
         cur.execute("""
             INSERT INTO batch (
                 batch_code, oil_type, seed_quantity_before_drying,
                 seed_quantity_after_drying, drying_loss, oil_yield,
                 oil_yield_percent, oil_cake_yield, oil_cake_yield_percent,
-                sludge_yield, sludge_yield_percent, production_date, recipe_id
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                sludge_yield, sludge_yield_percent, production_date, recipe_id,
+                traceable_code
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING batch_id
         """, (
             batch_code,
@@ -290,7 +336,8 @@ def add_batch():
             float(sludge_yield),
             float(sludge_yield_percent),
             production_date,
-            None  # recipe_id - can be added later
+            None,  # recipe_id - can be added later
+            batch_traceable_code
         ))
         
         batch_id = cur.fetchone()[0]
@@ -447,10 +494,11 @@ def add_batch():
             'success': True,
             'batch_id': batch_id,
             'batch_code': batch_code,
+            'traceable_code': batch_traceable_code,
             'oil_cost_per_kg': float(oil_cost_per_kg),
             'total_oil_produced': float(oil_yield),
             'net_oil_cost': float(net_oil_cost),
-            'message': f'Batch {batch_code} created successfully!'
+            'message': f'Batch {batch_code} created successfully with traceable code {batch_traceable_code}!'
         }), 201
         
     except Exception as e:
@@ -465,7 +513,7 @@ def add_batch():
 
 @batch_bp.route('/api/batch_history', methods=['GET'])
 def get_batch_history():
-    """Get batch production history with filters and analytics"""
+    """Get batch production history with filters, analytics, and traceable codes"""
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -498,7 +546,8 @@ def get_batch_history():
                 b.cake_estimated_rate,
                 b.sludge_estimated_rate,
                 COALESCE(b.cake_sold_quantity, 0) as cake_sold,
-                COALESCE(b.oil_cake_yield - b.cake_sold_quantity, b.oil_cake_yield) as cake_remaining
+                COALESCE(b.oil_cake_yield - b.cake_sold_quantity, b.oil_cake_yield) as cake_remaining,
+                b.traceable_code
             FROM batch b
             WHERE 1=1
         """
@@ -544,7 +593,8 @@ def get_batch_history():
                 'cake_rate': float(row[16]) if row[16] else 0,
                 'sludge_rate': float(row[17]) if row[17] else 0,
                 'cake_sold': float(row[18]),
-                'cake_remaining': float(row[19])
+                'cake_remaining': float(row[19]),
+                'traceable_code': row[20]
             })
         
         # Get summary statistics

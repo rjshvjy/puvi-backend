@@ -1,7 +1,6 @@
 """
 Main Flask Application for PUVI Oil Manufacturing System
-Integrates all modules and provides central configuration
-
+Integrates all modules including Cost Management
 File Path: puvi-backend/app.py
 """
 
@@ -15,7 +14,8 @@ from modules.purchase import purchase_bp
 from modules.material_writeoff import writeoff_bp
 from modules.batch_production import batch_bp
 from modules.blending import blending_bp
-from modules.material_sales import material_sales_bp  # NEW - Import material sales module
+from modules.material_sales import material_sales_bp
+from modules.cost_management import cost_management_bp  # NEW - Import cost management module
 
 # Create Flask app
 app = Flask(__name__)
@@ -42,7 +42,8 @@ app.register_blueprint(purchase_bp)
 app.register_blueprint(writeoff_bp)
 app.register_blueprint(batch_bp)
 app.register_blueprint(blending_bp)
-app.register_blueprint(material_sales_bp)  # NEW - Register material sales blueprint
+app.register_blueprint(material_sales_bp)
+app.register_blueprint(cost_management_bp)  # NEW - Register cost management blueprint
 
 # Configuration
 app.config['JSON_SORT_KEYS'] = False
@@ -54,7 +55,7 @@ def home():
     """Root endpoint to verify API is running"""
     return jsonify({
         'status': 'PUVI Backend API is running!',
-        'version': '6.0',  # Updated version
+        'version': '7.0',  # Updated version with Cost Management
         'timestamp': datetime.now().isoformat(),
         'endpoints': {
             'health': '/api/health',
@@ -84,12 +85,21 @@ def home():
                     '/api/create_blend',
                     '/api/blend_history'
                 ],
-                'material_sales': [  # NEW - Material sales endpoints
+                'material_sales': [
                     '/api/byproduct_types',
                     '/api/material_sales_inventory',
                     '/api/add_material_sale',
                     '/api/material_sales_history',
                     '/api/cost_reconciliation_report'
+                ],
+                'cost_management': [  # NEW - Cost management endpoints
+                    '/api/cost_elements/master',
+                    '/api/cost_elements/by_stage',
+                    '/api/cost_elements/time_tracking',
+                    '/api/cost_elements/calculate',
+                    '/api/cost_elements/save_batch_costs',
+                    '/api/cost_elements/batch_summary/<batch_id>',
+                    '/api/cost_elements/validation_report'
                 ]
             }
         }
@@ -110,7 +120,9 @@ def health_check():
             'batches': "SELECT COUNT(*) FROM batch",
             'writeoffs': "SELECT COUNT(*) FROM material_writeoffs",
             'blends': "SELECT COUNT(*) FROM blend_batches",
-            'material_sales': "SELECT COUNT(*) FROM oil_cake_sales",  # NEW - Count material sales
+            'material_sales': "SELECT COUNT(*) FROM oil_cake_sales",
+            'cost_elements': "SELECT COUNT(*) FROM cost_elements_master",  # NEW - Count cost elements
+            'time_tracking': "SELECT COUNT(*) FROM batch_time_tracking",   # NEW - Count time tracking
             'inventory_items': "SELECT COUNT(*) FROM inventory WHERE closing_stock > 0"
         }
         
@@ -128,6 +140,23 @@ def health_check():
         """)
         db_size = cur.fetchone()[0]
         
+        # Get cost validation warnings count (NEW)
+        try:
+            cur.execute("""
+                SELECT COUNT(DISTINCT b.batch_id)
+                FROM batch b
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM batch_extended_costs bec
+                    WHERE bec.batch_id = b.batch_id
+                )
+                AND b.production_date >= (
+                    SELECT MAX(production_date) - 30 FROM batch
+                )
+            """)
+            validation_warnings = cur.fetchone()[0]
+        except:
+            validation_warnings = 0
+        
         # Get active modules
         active_modules = []
         for rule in app.url_map.iter_rules():
@@ -141,10 +170,11 @@ def health_check():
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
-            'version': '6.0',
+            'version': '7.0',
             'counts': counts,
             'database_size_mb': round(db_size / 1024 / 1024, 2),
             'active_modules': sorted(active_modules),
+            'cost_validation_warnings': validation_warnings,  # NEW - Show validation warnings
             'timestamp': datetime.now().isoformat()
         })
         
@@ -263,7 +293,7 @@ def system_info():
                 'average_blend_cost': 0
             }
         
-        # Material Sales statistics - NEW
+        # Material Sales statistics
         try:
             cur.execute("""
                 SELECT 
@@ -297,6 +327,48 @@ def system_info():
                 'total_cost_adjustments': 0
             }
         
+        # Cost Management statistics (NEW)
+        try:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_cost_elements,
+                    COUNT(DISTINCT category) as cost_categories
+                FROM cost_elements_master
+                WHERE active = true
+            """)
+            row = cur.fetchone()
+            
+            cur.execute("""
+                SELECT 
+                    COUNT(DISTINCT batch_id) as batches_with_extended_costs,
+                    COALESCE(SUM(total_cost), 0) as total_extended_costs
+                FROM batch_extended_costs
+                WHERE is_applied = true
+            """)
+            extended = cur.fetchone()
+            
+            cur.execute("""
+                SELECT COUNT(*) as time_tracking_entries
+                FROM batch_time_tracking
+            """)
+            time_entries = cur.fetchone()
+            
+            stats['cost_management'] = {
+                'total_cost_elements': row[0],
+                'cost_categories': row[1],
+                'batches_with_extended_costs': extended[0],
+                'total_extended_costs': float(extended[1]),
+                'time_tracking_entries': time_entries[0]
+            }
+        except:
+            stats['cost_management'] = {
+                'total_cost_elements': 0,
+                'cost_categories': 0,
+                'batches_with_extended_costs': 0,
+                'total_extended_costs': 0,
+                'time_tracking_entries': 0
+            }
+        
         # Writeoff statistics
         cur.execute("""
             SELECT 
@@ -316,6 +388,79 @@ def system_info():
             'success': True,
             'statistics': stats,
             'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        close_connection(conn, cur)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# Cost validation endpoint (NEW)
+@app.route('/api/cost_validation_summary', methods=['GET'])
+def cost_validation_summary():
+    """Get summary of cost validation issues across all batches"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Get batches with missing costs
+        cur.execute("""
+            SELECT 
+                b.batch_id,
+                b.batch_code,
+                b.oil_type,
+                b.production_date,
+                b.oil_yield,
+                b.total_production_cost,
+                COUNT(bec.cost_id) as extended_costs_count,
+                COALESCE(SUM(bec.total_cost), 0) as total_extended_costs
+            FROM batch b
+            LEFT JOIN batch_extended_costs bec ON b.batch_id = bec.batch_id
+            WHERE b.production_date >= (
+                SELECT MAX(production_date) - 30 FROM batch
+            )
+            GROUP BY b.batch_id, b.batch_code, b.oil_type, b.production_date,
+                     b.oil_yield, b.total_production_cost
+            ORDER BY b.production_date DESC
+        """)
+        
+        batches = []
+        total_warnings = 0
+        
+        for row in cur.fetchall():
+            # Check if this batch has all required costs
+            batch_id = row[0]
+            
+            cur.execute("""
+                SELECT COUNT(*) 
+                FROM cost_elements_master 
+                WHERE active = true 
+                    AND applicable_to IN ('batch', 'all')
+                    AND is_optional = false
+            """)
+            required_costs = cur.fetchone()[0]
+            
+            missing_costs = required_costs - row[6]
+            
+            if missing_costs > 0:
+                total_warnings += 1
+                batches.append({
+                    'batch_id': row[0],
+                    'batch_code': row[1],
+                    'oil_type': row[2],
+                    'production_date': row[3],
+                    'oil_yield': float(row[4]),
+                    'base_cost': float(row[5]),
+                    'extended_costs': float(row[7]),
+                    'missing_cost_elements': missing_costs
+                })
+        
+        close_connection(conn, cur)
+        
+        return jsonify({
+            'success': True,
+            'total_batches_with_warnings': total_warnings,
+            'batches': batches,
+            'message': 'Phase 1 Validation - Warnings only'
         })
         
     except Exception as e:

@@ -20,7 +20,7 @@ from modules.cost_management import cost_management_bp  # NEW - Import cost mana
 # Create Flask app
 app = Flask(__name__)
 
-# Enable CORS for all routes - Updated to handle all Vercel URLs
+# Enable CORS for all routes - FIXED to handle ALL Vercel preview URLs
 CORS(app, resources={
     r"/api/*": {
         "origins": [
@@ -28,12 +28,13 @@ CORS(app, resources={
             "http://localhost:3001",
             "https://puvi-frontend.vercel.app",
             "https://puvi-frontend-*.vercel.app",
-            "https://*.vercel.app",  # This will catch all Vercel preview URLs
-            "https://puvi-frontend-740w3x6v2-rajeshs-projects-8be31e4e.vercel.app"  # Your specific URL
+            "https://*-rajeshs-projects-8be31e4e.vercel.app",  # This matches ALL your preview URLs
+            "https://*.vercel.app"
         ],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True
+        "allow_headers": ["Content-Type", "Authorization", "Access-Control-Allow-Origin"],
+        "supports_credentials": True,
+        "max_age": 3600
     }
 })
 

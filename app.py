@@ -2,8 +2,11 @@
 Main Flask Application for PUVI Oil Manufacturing System
 Integrates all modules including Cost Management
 File Path: puvi-backend/app.py
+Version: 7.0.1 - August 8, 2025
+Fixed: CORS configuration with regex for Vercel preview URLs
 """
 
+import re  # IMPORTANT: Add regex support for CORS wildcard matching
 from flask import Flask, jsonify
 from flask_cors import CORS
 from datetime import datetime
@@ -20,16 +23,16 @@ from modules.cost_management import cost_management_bp  # NEW - Import cost mana
 # Create Flask app
 app = Flask(__name__)
 
-# Enable CORS for all routes - FIXED to handle ALL Vercel preview URLs
+# Enable CORS for all routes - FIXED with regex for proper wildcard matching
 CORS(app, resources={
     r"/api/*": {
         "origins": [
             "http://localhost:3000",
             "http://localhost:3001",
             "https://puvi-frontend.vercel.app",
-            "https://puvi-frontend-*.vercel.app",
-            "https://*-rajeshs-projects-8be31e4e.vercel.app",  # This matches ALL your preview URLs
-            "https://*.vercel.app"
+            re.compile(r"^https://puvi-frontend-.*\.vercel\.app$"),  # Matches puvi-frontend-* preview URLs
+            re.compile(r"^https://.*-rajeshs-projects-8be31e4e\.vercel\.app$"),  # Matches all your project URLs
+            re.compile(r"^https://.*\.vercel\.app$")  # Fallback for any Vercel app
         ],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization", "Access-Control-Allow-Origin"],
@@ -56,7 +59,7 @@ def home():
     """Root endpoint to verify API is running"""
     return jsonify({
         'status': 'PUVI Backend API is running!',
-        'version': '7.0',  # Updated version with Cost Management
+        'version': '7.0.1',  # Fixed CORS with regex patterns
         'timestamp': datetime.now().isoformat(),
         'endpoints': {
             'health': '/api/health',
@@ -171,7 +174,7 @@ def health_check():
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
-            'version': '7.0',
+            'version': '7.0.1',
             'counts': counts,
             'database_size_mb': round(db_size / 1024 / 1024, 2),
             'active_modules': sorted(active_modules),
